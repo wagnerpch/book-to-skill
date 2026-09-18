@@ -136,15 +136,44 @@ def is_invisible_codepoint(codepoint: int) -> bool:
     return any(low <= codepoint <= high for low, high in _VARIATION_SELECTOR_RANGES)
 
 
+def _build_invisible_translation() -> dict[int, None]:
+    """Materialise every stripped code point into a ``str.translate`` table.
+
+    Derived from ``is_invisible_codepoint`` rather than from a second hand-written
+    list, so the table cannot drift from the predicate the generated-skill scanner
+    imports — the drift that docstring says it exists to prevent. The ranges below
+    are the only ones the predicate answers True for, so enumerating them is
+    exhaustive; everything else is decided by the frozensets directly.
+
+    The result is ~450 entries, built once at import.
+    """
+    codepoints: set[int] = set(_INVISIBLE_CODEPOINTS) | set(_ANNOTATION_CODEPOINTS)
+    codepoints.update(range(_DEPRECATED_FORMAT_RANGE[0], _DEPRECATED_FORMAT_RANGE[1] + 1))
+    codepoints.update(range(_TAG_BLOCK_START, _TAG_BLOCK_END + 1))
+    codepoints.update(range(_MUSICAL_FORMAT_RANGE[0], _MUSICAL_FORMAT_RANGE[1] + 1))
+    for low, high in _VARIATION_SELECTOR_RANGES:
+        codepoints.update(range(low, high + 1))
+    return dict.fromkeys(sorted(codepoints))
+
+
+_INVISIBLE_TRANSLATION = _build_invisible_translation()
+
+
 def sanitize_extracted_text(text: str) -> tuple[str, int]:
-    """Remove invisible code points used for document-borne prompt injection."""
-    kept: list[str] = []
-    removed = 0
+    """Remove invisible code points used for document-borne prompt injection.
 
-    for character in text:
-        if is_invisible_codepoint(ord(character)):
-            removed += 1
-            continue
-        kept.append(character)
+    Runs over the whole extracted corpus of every source, so the per-character
+    cost is multiplied by the size of the book. The previous implementation
+    appended one Python string object per character, which measured ~0.56 us and
+    ~10.6 bytes per character: on a 209M-character corpus that is roughly two
+    minutes and 2 GB spent *after* extraction had already produced the text, and
+    it was the second stage of the decompression-bomb amplification the archive
+    limits now cut off at the source. ``str.translate`` does the same filtering
+    in C, in a single pass, with a single allocation.
 
-    return "".join(kept), removed
+    The removal count is derived from the length difference rather than counted
+    in the loop, which is exact: the table only ever deletes code points, never
+    substitutes them.
+    """
+    cleaned = text.translate(_INVISIBLE_TRANSLATION)
+    return cleaned, len(text) - len(cleaned)
