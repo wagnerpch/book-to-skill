@@ -64,3 +64,58 @@ class ArchiveBudget:
 
         self.spent += declared
         return archive_file.read(name)
+
+
+# XML keywords are case-sensitive in the spec, so a conforming parser only
+# honours the uppercase forms; the scan uppercases anyway so a non-conforming
+# one cannot be used to slip a declaration past this check.
+_DOCTYPE_MARKER = "<!DOCTYPE"
+_ENTITY_MARKER = "<!ENTITY"
+
+# A DOCTYPE may be declared in any encoding an XML parser accepts, and a
+# single-encoding scan would miss the others. The cost of trying all of them is
+# what made this scan the decompression-bomb amplifier; ArchiveBudget caps the
+# input instead, so the coverage does not have to be traded away.
+_DECLARATION_ENCODINGS = ("utf-8", "utf-16", "utf-16le", "utf-16be", "utf-32")
+
+
+def scan_zip_xml_for_declarations(
+    archive_path: str,
+    *,
+    suffixes: tuple[str, ...],
+    reject_doctype: bool,
+) -> tuple[str, str] | None:
+    """Find the first XML member carrying a forbidden markup declaration.
+
+    Returns ``(member_name, marker)`` for the first offender, or ``None`` when
+    the archive is clean. Callers word their own error, because the two formats
+    need different rules and say so differently:
+
+    * DOCX passes ``reject_doctype=True``. OOXML never legitimately carries a
+      DOCTYPE, so any of them is refused.
+    * EPUB passes ``reject_doctype=False``. A DOCTYPE is ubiquitous and
+      legitimate there — ``<!DOCTYPE html>`` opens nearly every XHTML content
+      document and EPUB 2 files carry the public XHTML 1.1 identifier — so
+      refusing it would refuse most real books. An entity *declaration* is
+      refused in both, which is where billion-laughs and XXE payloads live.
+
+    Reads go through a fresh :class:`ArchiveBudget`, so a hostile archive cannot
+    exhaust memory during the very scan meant to screen it.
+    """
+    budget = ArchiveBudget()
+    markers = (_ENTITY_MARKER, _DOCTYPE_MARKER) if reject_doctype else (_ENTITY_MARKER,)
+
+    with zipfile.ZipFile(archive_path) as archive_file:
+        for name in archive_file.namelist():
+            if not name.lower().endswith(suffixes):
+                continue
+            xml_bytes = budget.read(archive_file, name)
+            for encoding in _DECLARATION_ENCODINGS:
+                try:
+                    content = xml_bytes.decode(encoding, errors="ignore").upper()
+                except LookupError:
+                    continue
+                for marker in markers:
+                    if marker in content:
+                        return name, marker
+    return None

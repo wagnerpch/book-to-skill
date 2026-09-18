@@ -4,9 +4,49 @@ import posixpath
 import re
 import zipfile
 import sys
-from book_to_skill.archive import ArchiveBudget
+from book_to_skill.archive import ArchiveBudget, scan_zip_xml_for_declarations
 from book_to_skill.exceptions import ExtractionError
 from book_to_skill.parsers.html import _HTMLTextExtractor
+
+
+# Members an XML parser will read. Content documents are included because
+# ebooklib hands them to lxml, so an entity declared in a chapter reaches a real
+# XML parser just as one in the OPF does.
+_XML_MEMBER_SUFFIXES = (".xml", ".opf", ".ncx", ".xhtml", ".html", ".htm")
+
+
+def validate_epub_xml_safety(epub_path: str) -> None:
+    """Refuse an EPUB that declares XML entities.
+
+    The stdlib path below reads the OPF with regular expressions and is safe by
+    construction, but ``extract_with_ebooklib`` hands the archive to ebooklib,
+    which parses it with lxml — so without this an entity declaration in an EPUB
+    reached a real XML parser unchecked, the gap ``validate_docx_xml_safety``
+    already closed for DOCX.
+
+    Unlike DOCX this does *not* refuse a DOCTYPE: ``<!DOCTYPE html>`` opens
+    nearly every XHTML content document and EPUB 2 files carry the public XHTML
+    1.1 identifier, so refusing DOCTYPEs would refuse most real books. Entity
+    declarations have no legitimate use in a book and are where both
+    billion-laughs and XXE payloads live.
+    """
+    try:
+        offender = scan_zip_xml_for_declarations(
+            epub_path, suffixes=_XML_MEMBER_SUFFIXES, reject_doctype=False
+        )
+        if offender is not None:
+            name, _marker = offender
+            raise ExtractionError(
+                f"Security validation failed: XML file '{name}' in EPUB archive "
+                "declares an XML entity, which is not used by legitimate books "
+                "and is the shape of an entity-expansion or XXE payload."
+            )
+    except zipfile.BadZipFile as e:
+        raise ExtractionError(f"Invalid EPUB file: {e}")
+    except ExtractionError:
+        raise
+    except Exception as e:
+        raise ExtractionError(f"Error during security validation of EPUB archive: {e}")
 
 
 _IMAGE_EXTENSIONS = (
@@ -29,6 +69,7 @@ def extract_with_ebooklib(epub_path: str) -> str | None:
         from ebooklib import epub
         from bs4 import BeautifulSoup
 
+        validate_epub_xml_safety(epub_path)
         book = epub.read_epub(epub_path)
         parts = []
         for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
@@ -37,6 +78,10 @@ def extract_with_ebooklib(epub_path: str) -> str | None:
         return "\n\n".join(parts)
     except ImportError:
         return None
+    except ExtractionError:
+        # A security refusal must not be downgraded to "ebooklib unavailable";
+        # the caller would fall through to the stdlib parser and read on.
+        raise
     except Exception as e:
         print(f"  [warn] extract_with_ebooklib failed: {type(e).__name__}: {e}", file=sys.stderr)
         return None
@@ -75,6 +120,10 @@ def _find_opf_path(zf: zipfile.ZipFile, budget: ArchiveBudget | None = None) -> 
 
 def extract_with_zipfile(epub_path: str) -> str | None:
     """stdlib-only EPUB extractor: unzip → parse HTML files."""
+    # Self-defending, like the DOCX parsers: this path parses the OPF with
+    # regular expressions rather than an XML parser, but validating here means
+    # the guard does not depend on which extractor the caller happened to reach.
+    validate_epub_xml_safety(epub_path)
     budget = ArchiveBudget()
     try:
         with zipfile.ZipFile(epub_path) as zf:

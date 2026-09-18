@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import zipfile
 import sys
-from book_to_skill.archive import ArchiveBudget
+from book_to_skill.archive import ArchiveBudget, scan_zip_xml_for_declarations
 from book_to_skill.exceptions import ExtractionError
 
 
@@ -100,20 +100,16 @@ def extract_docx_with_zipfile(docx_path: str) -> str | None:
 def validate_docx_xml_safety(docx_path: str) -> None:
     """Scan all XML files in the DOCX zip archive to prevent XML Entity Expansion (Billion Laughs) and XXE injections."""
     try:
-        budget = ArchiveBudget()
-        with zipfile.ZipFile(docx_path) as zf:
-            for name in zf.namelist():
-                if name.endswith(".xml") or name.endswith(".rels"):
-                    xml_bytes = budget.read(zf, name)
-                    for encoding in ("utf-8", "utf-16", "utf-16le", "utf-16be", "utf-32"):
-                        try:
-                            content = xml_bytes.decode(encoding, errors="ignore").upper()
-                        except LookupError:
-                            continue
-                        if "<!DOCTYPE" in content or "<!ENTITY" in content:
-                            raise ExtractionError(
-                                f"Security validation failed: XML file '{name}' in DOCX archive contains forbidden DTD or entity declarations."
-                            )
+        # reject_doctype=True: OOXML has no legitimate DOCTYPE, so DOCX stays
+        # stricter than the EPUB guard, which has to allow the XHTML ones.
+        offender = scan_zip_xml_for_declarations(
+            docx_path, suffixes=(".xml", ".rels"), reject_doctype=True
+        )
+        if offender is not None:
+            name, _marker = offender
+            raise ExtractionError(
+                f"Security validation failed: XML file '{name}' in DOCX archive contains forbidden DTD or entity declarations."
+            )
     except zipfile.BadZipFile as e:
         raise ExtractionError(f"Invalid DOCX file: {e}")
     except ExtractionError:
