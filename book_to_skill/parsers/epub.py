@@ -4,6 +4,8 @@ import posixpath
 import re
 import zipfile
 import sys
+from book_to_skill.archive import ArchiveBudget
+from book_to_skill.exceptions import ExtractionError
 from book_to_skill.parsers.html import _HTMLTextExtractor
 
 
@@ -40,19 +42,30 @@ def extract_with_ebooklib(epub_path: str) -> str | None:
         return None
 
 
-def _find_opf_path(zf: zipfile.ZipFile) -> str | None:
+def _find_opf_path(zf: zipfile.ZipFile, budget: ArchiveBudget | None = None) -> str | None:
     """Locate the OPF package document inside an EPUB archive.
 
     First tries ``META-INF/container.xml`` (the spec-defined entry point),
     then falls back to scanning the archive for any ``.opf`` file.
+
+    ``budget`` is optional so a caller reading only this one small member does
+    not have to thread one through; the extraction paths pass their own so the
+    container and the OPF count against the same per-archive ceiling as the
+    chapters that follow.
     """
+    if budget is None:
+        budget = ArchiveBudget()
     # Spec-defined: read container.xml for the rootfile path
     try:
-        container = zf.read("META-INF/container.xml").decode("utf-8", errors="replace")
+        container = budget.read(zf, "META-INF/container.xml").decode("utf-8", errors="replace")
         match = re.search(r'full-path=["\']([^"\']+\.opf)["\']', container)
         if match:
             return match.group(1)
-    except (KeyError, Exception):
+    except ExtractionError:
+        # A size refusal must not be downgraded to "no container.xml"; that
+        # would silently fall through to the .opf glob and read on.
+        raise
+    except Exception:
         pass
 
     # Fallback: glob for any .opf file
@@ -62,12 +75,13 @@ def _find_opf_path(zf: zipfile.ZipFile) -> str | None:
 
 def extract_with_zipfile(epub_path: str) -> str | None:
     """stdlib-only EPUB extractor: unzip → parse HTML files."""
+    budget = ArchiveBudget()
     try:
         with zipfile.ZipFile(epub_path) as zf:
             names = zf.namelist()
 
             # Locate OPF and determine its directory for resolving relative hrefs
-            opf_path = _find_opf_path(zf)
+            opf_path = _find_opf_path(zf, budget)
             opf_dir = posixpath.dirname(opf_path) if opf_path else ""
 
             # Build reading order from the OPF spine (not the manifest's href
@@ -75,7 +89,7 @@ def extract_with_zipfile(epub_path: str) -> str | None:
             spine_order: list[str] = []
             seen: set[str] = set()
             if opf_path:
-                opf_text = zf.read(opf_path).decode("utf-8", errors="replace")
+                opf_text = budget.read(zf, opf_path).decode("utf-8", errors="replace")
 
                 # Manifest: item id -> resolved href. Parse each <item> opening
                 # tag so attribute order (id before/after href) does not matter;
@@ -113,13 +127,19 @@ def extract_with_zipfile(epub_path: str) -> str | None:
             parts = []
             for name in html_files:
                 try:
-                    raw = zf.read(name).decode("utf-8", errors="replace")
+                    raw = budget.read(zf, name).decode("utf-8", errors="replace")
                     parser = _HTMLTextExtractor()
                     parser.feed(raw)
                     parts.append(parser.get_text())
+                except ExtractionError:
+                    # Skipping a refused member would keep reading the rest of a
+                    # hostile archive; the whole source has to fail instead.
+                    raise
                 except Exception:
                     continue
             return "\n\n".join(parts) if parts else None
+    except ExtractionError:
+        raise
     except Exception as e:
         print(f"  [warn] extract_with_zipfile failed: {type(e).__name__}: {e}", file=sys.stderr)
         return None
@@ -129,10 +149,11 @@ def count_epub_chapters(epub_path: str) -> int:
     """Count spine items (approximate chapter count) without dependencies."""
     try:
         with zipfile.ZipFile(epub_path) as zf:
-            opf_path = _find_opf_path(zf)
+            budget = ArchiveBudget()
+            opf_path = _find_opf_path(zf, budget)
             if not opf_path:
                 return 0
-            opf_text = zf.read(opf_path).decode("utf-8", errors="replace")
+            opf_text = budget.read(zf, opf_path).decode("utf-8", errors="replace")
             return len(re.findall(r'<itemref\b', opf_text))
     except Exception:
         return 0
