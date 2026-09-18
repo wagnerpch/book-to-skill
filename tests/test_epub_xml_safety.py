@@ -15,6 +15,7 @@ entity *declaration*, which is where both billion-laughs and XXE payloads live,
 so that is what the EPUB guard refuses.
 """
 
+import importlib.util
 import sys
 import zipfile
 from pathlib import Path
@@ -92,6 +93,34 @@ class TestEntityDeclarationsAreRefused:
 
         with pytest.raises(ExtractionError, match="entity"):
             extract_with_zipfile(str(path))
+
+
+class TestEbooklibPathSeparatesSecurityFromIO:
+    """``extract_with_ebooklib`` returns ``str | None`` for every ordinary
+    failure — a missing file, an unreadable archive, ebooklib not installed —
+    because the caller falls through to the stdlib parser on ``None``. A
+    security refusal is the one thing that must *not* take that path: falling
+    through would hand the same hostile archive to the next parser. These two
+    tests pull in opposite directions on purpose, so a fix to either one that
+    collapses the distinction fails the other.
+    """
+
+    def test_missing_file_returns_none_rather_than_raising(self):
+        from book_to_skill.parsers.epub import extract_with_ebooklib
+
+        assert extract_with_ebooklib("nonexistent.epub") is None
+
+    @pytest.mark.skipif(
+        importlib.util.find_spec("ebooklib") is None,
+        reason="ebooklib is an optional dependency; without it this path is never reached",
+    )
+    def test_entity_declaration_propagates_instead_of_falling_through(self, tmp_path):
+        from book_to_skill.parsers.epub import extract_with_ebooklib
+
+        path = _write_epub(tmp_path / "xxe.epub", opf=XXE_EXTERNAL)
+
+        with pytest.raises(ExtractionError, match="entity"):
+            extract_with_ebooklib(path)
 
 
 class TestOrdinaryEpubDoctypesStillWork:

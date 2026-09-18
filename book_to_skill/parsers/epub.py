@@ -29,24 +29,25 @@ def validate_epub_xml_safety(epub_path: str) -> None:
     1.1 identifier, so refusing DOCTYPEs would refuse most real books. Entity
     declarations have no legitimate use in a book and are where both
     billion-laughs and XXE payloads live.
+
+    Raises ``ExtractionError`` only for a security verdict. An archive that
+    cannot be opened or read at all raises whatever ``zipfile`` raised —
+    BadZipFile, OSError — and each caller keeps handling that the way it always
+    did. Translating those here made an unreadable file indistinguishable from a
+    hostile one, which broke ``extract_with_ebooklib``'s contract of returning
+    ``str | None`` for ordinary failures: the caller stopped falling through to
+    the stdlib parser for a file that was merely missing.
     """
-    try:
-        offender = scan_zip_xml_for_declarations(
-            epub_path, suffixes=_XML_MEMBER_SUFFIXES, reject_doctype=False
+    offender = scan_zip_xml_for_declarations(
+        epub_path, suffixes=_XML_MEMBER_SUFFIXES, reject_doctype=False
+    )
+    if offender is not None:
+        name, _marker = offender
+        raise ExtractionError(
+            f"Security validation failed: XML file '{name}' in EPUB archive "
+            "declares an XML entity, which is not used by legitimate books "
+            "and is the shape of an entity-expansion or XXE payload."
         )
-        if offender is not None:
-            name, _marker = offender
-            raise ExtractionError(
-                f"Security validation failed: XML file '{name}' in EPUB archive "
-                "declares an XML entity, which is not used by legitimate books "
-                "and is the shape of an entity-expansion or XXE payload."
-            )
-    except zipfile.BadZipFile as e:
-        raise ExtractionError(f"Invalid EPUB file: {e}")
-    except ExtractionError:
-        raise
-    except Exception as e:
-        raise ExtractionError(f"Error during security validation of EPUB archive: {e}")
 
 
 _IMAGE_EXTENSIONS = (
@@ -120,12 +121,14 @@ def _find_opf_path(zf: zipfile.ZipFile, budget: ArchiveBudget | None = None) -> 
 
 def extract_with_zipfile(epub_path: str) -> str | None:
     """stdlib-only EPUB extractor: unzip → parse HTML files."""
-    # Self-defending, like the DOCX parsers: this path parses the OPF with
-    # regular expressions rather than an XML parser, but validating here means
-    # the guard does not depend on which extractor the caller happened to reach.
-    validate_epub_xml_safety(epub_path)
     budget = ArchiveBudget()
     try:
+        # Self-defending, like the DOCX parsers: this path parses the OPF with
+        # regular expressions rather than an XML parser, but validating here
+        # means the guard does not depend on which extractor the caller reached.
+        # Inside the try, so an unopenable archive still returns None through
+        # the handler below instead of escaping as a bare OSError.
+        validate_epub_xml_safety(epub_path)
         with zipfile.ZipFile(epub_path) as zf:
             names = zf.namelist()
 
